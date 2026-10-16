@@ -14,9 +14,9 @@
 **Windows, без Python:** скачай `FartTogether-windows.zip` со страницы
 [Releases](https://github.com/Callzik/fart-together/releases/latest), распакуй целиком и запусти `FartTogether.exe`.
 
-**Как выпустить новую версию:** создай тег, например `v2.1`
-(`git tag v2.1 && git push origin v2.1`, или на GitHub: Releases → Draft a new release → новый тег).
-GitHub Actions сам соберёт игру и приложит zip к релизу.
+**Как выпустить новую версию:** на GitHub открой **Actions → Build Windows exe → Run workflow**,
+впиши версию (например `v2.1`) и нажми **Run workflow**. Игра соберётся, и появится релиз с zip.
+Можно и тегом: `git tag v2.1 && git push origin v2.1`.
 
 **Из исходников** (Python 3.9+, движок [Panda3D](https://www.panda3d.org/)):
 
