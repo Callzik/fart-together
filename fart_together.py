@@ -12,7 +12,11 @@ import os
 import random
 import sys
 
+import time
+
 import pygame
+
+import net
 
 W, H = 960, 720
 FPS = 60
@@ -250,6 +254,11 @@ class Game:
         self.best = self.load_best()
         self.state = "menu"
         self.mode = "solo"
+        self.net = None
+        self.my_seat = 0
+        self.ip_text = ""
+        self.net_msg = ""
+        self.new_record = False
         self.reset()
 
     # ------------------------------------------------------------ save
@@ -293,7 +302,14 @@ class Game:
         return math.cos(a), math.sin(a)
 
     # ------------------------------------------------------------ input
+    def local_fart(self, keys):
+        return bool(keys[pygame.K_SPACE] or keys[self.seats[self.my_seat].key])
+
     def wanted_farts(self, keys):
+        if self.mode == "host":
+            res = [bool(v) for v in self.net.inputs]
+            res[0] = self.local_fart(keys)
+            return res
         if self.mode == "coop":
             return [keys[s.key] for s in self.seats]
         dx = (keys[pygame.K_RIGHT] or keys[pygame.K_d]) - (keys[pygame.K_LEFT] or keys[pygame.K_a])
@@ -315,6 +331,9 @@ class Game:
         if self.flash_t > 0:
             self.flash_t -= dt
         self.update_particles(dt)
+        if self.mode == "client":
+            self.client_update(dt, keys)
+            return
         if self.state != "play":
             for s in self.seats:
                 self.stop_sound(s)
@@ -350,13 +369,7 @@ class Game:
                 ax += -sx * 900
                 ay += -sy * 900
                 self.spin += (1 if i % 2 else -1) * 0.9 * dt
-                bx, by = self.x + sx * RAFT_R, self.y + sy * RAFT_R
-                for _ in range(3):
-                    sp = random.uniform(150, 320)
-                    a = math.atan2(sy, sx) + random.uniform(-0.5, 0.5)
-                    self.particles.append(Particle(bx, by, math.cos(a) * sp + self.vx * 0.5,
-                                                   math.sin(a) * sp + self.vy * 0.5,
-                                                   random.uniform(0.4, 0.9), random.uniform(8, 16)))
+                self.spawn_gas(i)
                 self.play_sound(seat)
             else:
                 seat.gas = min(100, seat.gas + 22 * dt)
@@ -412,6 +425,94 @@ class Game:
             self.say("Чекпоинт!")
         if s >= TRACK_LEN:
             self.finish()
+        self.cam.follow(self.x, self.y, dt)
+
+    def spawn_gas(self, i):
+        sx, sy = self.seat_dir(i)
+        bx, by = self.x + sx * RAFT_R, self.y + sy * RAFT_R
+        for _ in range(3):
+            sp = random.uniform(150, 320)
+            a = math.atan2(sy, sx) + random.uniform(-0.5, 0.5)
+            self.particles.append(Particle(bx, by, math.cos(a) * sp + self.vx * 0.5,
+                                           math.sin(a) * sp + self.vy * 0.5,
+                                           random.uniform(0.4, 0.9), random.uniform(8, 16)))
+
+    # ------------------------------------------------------------ online
+    def start_host(self):
+        try:
+            self.net = net.Host()
+        except OSError as e:
+            self.net_msg = f"Не удалось открыть порт {net.PORT}: {e}"
+            return
+        self.mode, self.my_seat, self.net_msg = "host", 0, ""
+        self.ips = net.local_ips()
+        self.reset()
+        self.state = "lobby"
+
+    def start_join(self):
+        self.net = net.Client(self.ip_text)
+        self.mode, self.net_msg = "client", ""
+        self.reset()
+        self.state = "joining"
+
+    def leave_online(self, msg=""):
+        if self.net:
+            self.net.close()
+        self.net = None
+        self.mode, self.my_seat = "solo", 0
+        self.net_msg = msg
+        self.reset()
+        self.state = "menu"
+
+    def snapshot(self):
+        return {
+            "type": "state", "st": self.state, "x": round(self.x, 1), "y": round(self.y, 1),
+            "vx": round(self.vx, 1), "vy": round(self.vy, 1), "a": round(self.ang, 3),
+            "sp": round(self.spin, 3), "t": round(self.t, 3), "tm": round(self.time, 2),
+            "fl": round(self.falling, 2), "cp": self.checkpoint, "falls": self.falls,
+            "cd": round(self.countdown, 2), "fs": self.flash, "ft": round(self.flash_t, 2),
+            "nr": self.new_record, "pl": self.net.seats_taken(),
+            "g": [[round(st.gas, 1), st.empty, st.farting] for st in self.seats],
+        }
+
+    def net_tick(self):
+        if self.mode == "host" and self.net:
+            self.net.broadcast(self.snapshot())
+
+    def client_update(self, dt, keys):
+        c = self.net
+        if c.error:
+            self.leave_online(c.error)
+            return
+        if c.seat is not None:
+            self.my_seat = c.seat
+        st = c.state
+        if st is None:
+            return
+        age = min(0.25, time.monotonic() - c.state_time)
+        self.state = {"lobby": "joining"}.get(st["st"], st["st"])
+        self.players = st["pl"]
+        self.vx, self.vy, self.spin = st["vx"], st["vy"], st["sp"]
+        moving = st["st"] == "play" and st["cd"] <= 0 and st["fl"] <= 0
+        tx = st["x"] + (self.vx * age if moving else 0)
+        ty = st["y"] + (self.vy * age if moving else 0)
+        if math.hypot(tx - self.x, ty - self.y) > 200:
+            self.x, self.y = tx, ty
+        else:
+            self.x += (tx - self.x) * min(1, dt * 15)
+            self.y += (ty - self.y) * min(1, dt * 15)
+        self.ang = st["a"] + (self.spin * age if moving else 0)
+        self.t = st["t"] + age
+        self.time, self.falling, self.checkpoint = st["tm"], st["fl"], st["cp"]
+        self.falls, self.countdown, self.new_record = st["falls"], st["cd"], st["nr"]
+        self.flash, self.flash_t = st["fs"], st["ft"]
+        for i, (gas, empty, farting) in enumerate(st["g"]):
+            seat = self.seats[i]
+            seat.gas, seat.empty, seat.farting = gas, empty, farting
+            if farting and self.state == "play":
+                self.spawn_gas(i)
+                self.play_sound(seat)
+        c.send_input(self.local_fart(keys) if self.state == "play" else False)
         self.cam.follow(self.x, self.y, dt)
 
     def update_particles(self, dt):
@@ -477,6 +578,34 @@ class Game:
             self.draw_finish_screen(surf)
         elif self.state == "pause":
             self.overlay(surf, ["Пауза", "", "Esc — продолжить", "R — заново", "Q — в меню"])
+        elif self.state == "lobby":
+            names = ", ".join(self.seats[i].name for i in self.net.seats_taken())
+            self.overlay(surf, [
+                "Онлайн: ты хост",
+                "Друзья выбирают «Подключиться» и вводят один из адресов:",
+                "   ".join(f"{ip}:{net.PORT}" for ip in self.ips),
+                "Через интернет: Radmin VPN / ZeroTier / playit.gg (см. README)",
+                "",
+                f"Игроки ({len(self.net.seats_taken())}/4): {names}",
+                "",
+                "Enter — старт, Esc — отмена",
+            ])
+        elif self.state == "join":
+            cursor = "_" if int(self.t * 2) % 2 else " "
+            self.overlay(surf, [
+                "Подключиться",
+                "Введи адрес хоста (например 192.168.1.5 или 26.10.20.30:5555):",
+                self.ip_text + cursor,
+                "",
+                "Enter — подключиться, Esc — назад",
+            ])
+        elif self.state == "joining":
+            c = self.net
+            if c.seat is None:
+                line = "Подключаюсь..."
+            else:
+                line = f"Ты — {self.seats[c.seat].name}. Ждём, пока хост нажмёт старт"
+            self.overlay(surf, ["Онлайн", line, "", "Esc — выйти"])
 
     def edge_points(self):
         top = self.cam.y - H / 2 - 80
@@ -644,6 +773,12 @@ class Game:
             pygame.draw.rect(surf, (30, 60, 110), (x, y, 165, 36), border_radius=10)
             pygame.draw.circle(surf, seat.color, (x + 18, y + 18), 12)
             key = seat.label if self.mode == "coop" else ""
+            if self.mode in ("host", "client"):
+                if i == self.my_seat:
+                    key = "(ты)"
+                    pygame.draw.rect(surf, GAS, (x - 2, y - 2, 169, 40), width=3, border_radius=11)
+                elif i not in getattr(self, "players", [0]) and not (self.mode == "host" and i in self.net.seats_taken()):
+                    key = "—"
             lbl = self.font.render(f"{seat.name} {key}", True, WHITE)
             surf.blit(lbl, (x + 36, y + 2))
             g = pygame.Rect(x + 36, y + 24, 120, 7)
@@ -654,6 +789,9 @@ class Game:
         if self.flash_t > 0:
             t = self.mid.render(self.flash, True, WHITE)
             surf.blit(t, t.get_rect(center=(W / 2, 90)))
+        if self.mode in ("host", "client") and self.state == "play":
+            t = self.small.render("Пробел — пукать (Esc — выйти из онлайна)", True, WHITE)
+            surf.blit(t, (20, H - 72))
         if self.state == "play" and self.countdown > 0:
             n = int(math.ceil(self.countdown))
             t = self.big.render(str(n), True, WHITE)
@@ -679,8 +817,10 @@ class Game:
             "",
             "1 — Соло: стрелки / WASD (нужные звери пукают сами)",
             "2 — Вместе на одной клавиатуре: Лягуха Q, Мишаня P, Бегемот Z, Мартын M",
+            "3 — Онлайн: создать игру        4 — Онлайн: подключиться",
             "",
             best,
+            self.net_msg,
             "Esc — пауза / выход",
         ])
 
@@ -689,12 +829,41 @@ class Game:
         lines = ["ФИНИШ!", f"Время: {int(t // 60):02d}:{t % 60:05.2f}", f"Падений: {self.falls}"]
         if self.new_record:
             lines.append("Новый рекорд!")
-        lines += ["", "Enter — ещё раз", "Esc — в меню"]
+        if self.mode == "client":
+            lines += ["", "Ждём, пока хост начнёт заново", "Esc — выйти"]
+        else:
+            lines += ["", "Enter — ещё раз", "Esc — в меню"]
         self.overlay(surf, lines)
 
     # ------------------------------------------------------------ events
     def handle(self, ev):
+        if self.state == "join" and ev.type == pygame.TEXTINPUT:
+            ch = "".join(c for c in ev.text if c.isalnum() or c in ".:-")
+            self.ip_text = (self.ip_text + ch)[:60]
+            return True
         if ev.type != pygame.KEYDOWN:
+            return True
+        if self.mode == "client":
+            if ev.key == pygame.K_ESCAPE:
+                self.leave_online()
+            return True
+        if self.state == "lobby":
+            if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.reset()
+                self.state = "play"
+            elif ev.key == pygame.K_ESCAPE:
+                self.leave_online()
+            return True
+        if self.state == "join":
+            if ev.key == pygame.K_BACKSPACE:
+                self.ip_text = self.ip_text[:-1]
+            elif ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and self.ip_text.strip():
+                self.start_join()
+            elif ev.key == pygame.K_ESCAPE:
+                self.state = "menu"
+            return True
+        if self.mode == "host" and ev.key == pygame.K_ESCAPE and self.state != "finish":
+            self.leave_online()
             return True
         if self.state == "menu":
             if ev.key in (pygame.K_1, pygame.K_KP1):
@@ -705,6 +874,10 @@ class Game:
                 self.mode = "coop"
                 self.reset()
                 self.state = "play"
+            elif ev.key in (pygame.K_3, pygame.K_KP3):
+                self.start_host()
+            elif ev.key in (pygame.K_4, pygame.K_KP4):
+                self.state = "join"
             elif ev.key == pygame.K_ESCAPE:
                 return False
         elif self.state == "play":
@@ -724,8 +897,11 @@ class Game:
                 self.reset()
                 self.state = "play"
             elif ev.key == pygame.K_ESCAPE:
-                self.reset()
-                self.state = "menu"
+                if self.mode == "host":
+                    self.leave_online()
+                else:
+                    self.reset()
+                    self.state = "menu"
         return True
 
 
@@ -755,11 +931,14 @@ def main():
             elif not game.handle(ev):
                 running = False
         game.update(dt, pygame.key.get_pressed())
+        game.net_tick()
         game.draw()
         pygame.display.flip()
         n += 1
         if frames and n >= frames:
             running = False
+    if game.net:
+        game.net.close()
     pygame.quit()
 
 
