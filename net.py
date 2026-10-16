@@ -55,6 +55,7 @@ class Host:
         self.lock = threading.Lock()
         self.clients = {}  # seat -> socket
         self.inputs = [False] * MAX_PLAYERS
+        self.names = {}  # seat -> ник
         self.error = None
         self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -98,6 +99,8 @@ class Host:
             for msg in _lines(sock):
                 if msg.get("type") == "in":
                     self.inputs[seat] = bool(msg.get("f"))
+                elif msg.get("type") == "hello":
+                    self.names[seat] = str(msg.get("name", ""))[:16]
         except (OSError, ValueError):
             pass
         self._drop(seat)
@@ -105,6 +108,7 @@ class Host:
     def _drop(self, seat):
         with self.lock:
             sock = self.clients.pop(seat, None)
+            self.names.pop(seat, None)
         self.inputs[seat] = False
         if sock:
             try:
@@ -133,7 +137,8 @@ class Host:
 
 
 class Client:
-    def __init__(self, address):
+    def __init__(self, address, name=""):
+        self.name = name
         host, _, port = address.strip().partition(":")
         self.seat = None
         self.state = None
@@ -151,6 +156,7 @@ class Client:
             self.sock.settimeout(None)
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.connected = True
+            _send(self.sock, {"type": "hello", "name": self.name})
             for msg in _lines(self.sock):
                 kind = msg.get("type")
                 if kind == "welcome":

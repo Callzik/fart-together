@@ -114,7 +114,12 @@ class FartApp(ShowBase):
             self.font = None
 
         self.world = sim.World()
-        self.world.best = self.load_best()
+        self.settings = self.load_settings()
+        self.world.best = self.settings.get("best")
+        self.nick = self.settings.get("nick") or "Игрок"
+        self.nick_text = ""
+        self.nicks = [None] * 4
+        self.label_cache = [None] * 4
         self.mode = "solo"
         self.net = None
         self.my_seat = 0
@@ -131,19 +136,27 @@ class FartApp(ShowBase):
         self.task_mgr.add(self.loop, "loop")
 
     # ------------------------------------------------------------ save
-    def load_best(self):
+    def load_settings(self):
         try:
-            with open(SAVE_FILE) as f:
-                return json.load(f).get("best")
+            with open(SAVE_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
         except Exception:
-            return None
+            return {}
 
-    def save_best(self):
+    def save_settings(self):
+        self.settings.update(best=self.world.best, nick=self.nick)
         try:
-            with open(SAVE_FILE, "w") as f:
-                json.dump({"best": self.world.best}, f)
+            with open(SAVE_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, ensure_ascii=False)
         except Exception:
             pass
+
+    def save_best(self):
+        self.save_settings()
+
+    def display_name(self, i):
+        return self.nicks[i] or self.world.seats[i].name
 
     # ------------------------------------------------------------ scene
     def setup_scene(self):
@@ -300,7 +313,7 @@ class FartApp(ShowBase):
                 suffix = f"  [{seat.key.upper()}]"
             elif online:
                 suffix = "  (ты)" if i == self.my_seat else ("" if i in players else "  —")
-            label.setText(seat.name + suffix)
+            label.setText((self.nicks[i] or seat.name) + suffix)
             bar["frameSize"] = (0, 0.44 * max(0.001, seat.gas) / 100, -0.035, -0.015)
             bar["frameColor"] = (0.9, 0.3, 0.25, 1) if seat.empty else gfx.C_GAS
             fr["frameColor"] = (0.30, 0.45, 0.15, 0.75) if online and i == self.my_seat else (0.12, 0.18, 0.28, 0.6)
@@ -317,14 +330,14 @@ class FartApp(ShowBase):
                 "2   Вместе за одной клавиатурой: Q, P, Z, M",
                 "3   Онлайн: создать игру",
                 "4   Онлайн: подключиться",
-                "",
+                f"5   Сменить ник: {self.nick}",
                 best,
                 self.net_msg or "Esc — выход",
             ])
         elif st == "pause":
             self.show_overlay("Пауза", ["", "Esc — продолжить", "R — заново", "Q — в меню"])
         elif st == "lobby":
-            names = ", ".join(w.seats[i].name for i in self.net.seats_taken())
+            names = ", ".join(f"{self.display_name(i)} ({w.seats[i].name})" for i in self.net.seats_taken())
             self.show_overlay("Онлайн: ты хост", [
                 "Друзья выбирают «Подключиться» и вводят один из адресов:",
                 "   ".join(f"{ip}:{net.PORT}" for ip in self.ips),
@@ -333,6 +346,15 @@ class FartApp(ShowBase):
                 f"Игроки ({len(self.net.seats_taken())}/4): {names}",
                 "",
                 "Enter — старт, Esc — отмена",
+            ])
+        elif st == "nick":
+            cursor = "_" if int(time.monotonic() * 2) % 2 else " "
+            self.show_overlay("Ник", [
+                "Как тебя будут видеть другие игроки (до 16 символов):",
+                "",
+                self.nick_text + cursor,
+                "",
+                "Enter — сохранить, Esc — отмена",
             ])
         elif st == "join":
             cursor = "_" if int(time.monotonic() * 2) % 2 else " "
@@ -345,7 +367,7 @@ class FartApp(ShowBase):
             ])
         elif st == "joining":
             c = self.net
-            line = "Подключаюсь..." if c.seat is None else f"Ты — {w.seats[c.seat].name}. Ждём, пока хост нажмёт старт"
+            line = "Подключаюсь..." if c.seat is None else f"Ты — {self.nick} ({w.seats[c.seat].name}). Ждём, пока хост нажмёт старт"
             self.show_overlay("Онлайн", [line, "", "Esc — выйти"])
         elif st == "finish":
             lines = [f"Время: {self.fmt(w.time)}", f"Падений: {w.falls}"]
@@ -363,7 +385,7 @@ class FartApp(ShowBase):
     # ------------------------------------------------------------ input
     def setup_input(self):
         self.accept("keystroke", self.on_char)
-        for key in ("escape", "enter", "backspace", "1", "2", "3", "4", "r", "q"):
+        for key in ("escape", "enter", "backspace", "1", "2", "3", "4", "5", "r", "q"):
             self.accept(key, self.on_key, [key])
 
     def down(self, name):
@@ -399,6 +421,10 @@ class FartApp(ShowBase):
         return w.auto_farts(dx, dy)
 
     def on_char(self, ch):
+        if self.world.state == "nick":
+            if ch.isprintable() and ch not in "\r\n\t" and len(self.nick_text) < 16:
+                self.nick_text += ch
+            return
         if self.world.state == "join" and (ch.isalnum() or ch in ".:-"):
             self.ip_text = (self.ip_text + ch)[:60]
 
@@ -414,6 +440,17 @@ class FartApp(ShowBase):
         if self.mode == "client":
             if key == "escape":
                 self.leave_online()
+            return
+        if st == "nick":
+            if key == "backspace":
+                self.nick_text = self.nick_text[:-1]
+            elif key == "enter":
+                if self.nick_text.strip():
+                    self.nick = self.nick_text.strip()
+                    self.save_settings()
+                w.state = "menu"
+            elif key == "escape":
+                w.state = "menu"
             return
         if st == "join":
             if key == "backspace":
@@ -436,6 +473,9 @@ class FartApp(ShowBase):
                 self.start_host()
             elif key == "4":
                 w.state = "join"
+            elif key == "5":
+                self.nick_text = self.nick
+                w.state = "nick"
             elif key == "escape":
                 self.user_exit()
         elif st == "play":
@@ -475,7 +515,7 @@ class FartApp(ShowBase):
         self.world.state = "lobby"
 
     def start_join(self):
-        self.net = net.Client(self.ip_text)
+        self.net = net.Client(self.ip_text, self.nick)
         self.mode, self.net_msg = "client", ""
         self.world.reset()
         self.world.state = "joining"
@@ -496,6 +536,12 @@ class FartApp(ShowBase):
 
     def tick(self, dt):
         w = self.world
+        if self.mode == "host" and self.net:
+            self.nicks = [self.nick] + [self.net.names.get(i) for i in range(1, 4)]
+        elif self.mode == "client" and self.net and self.net.state:
+            self.nicks = list(self.net.state.get("nm") or [None] * 4)
+        else:
+            self.nicks = [None] * 4
         if self.mode == "client":
             c = self.net
             if c.error:
@@ -514,7 +560,9 @@ class FartApp(ShowBase):
             if was == "play" and w.state == "finish" and w.new_record:
                 self.save_best()
             if self.mode == "host" and self.net:
-                self.net.broadcast(w.snapshot(self.net.seats_taken()))
+                snap = w.snapshot(self.net.seats_taken())
+                snap["nm"] = [self.nick] + [self.net.names.get(i) for i in range(1, 4)]
+                self.net.broadcast(snap)
         self.update_scene(dt)
         self.update_hud()
 
@@ -573,6 +621,10 @@ class FartApp(ShowBase):
             a.set_h(math.degrees(math.atan2(sx, sy)))
             lbl.set_pos(pos + Vec3(sx * SEAT_R * 1.1, -sy * SEAT_R * 1.1, 1.0))
             lbl.node().set_text_color(1, 1, 1, 1 if i in players else 0.35)
+            name = self.display_name(i)
+            if self.label_cache[i] != name:
+                self.label_cache[i] = name
+                lbl.node().set_text(name)
             if seat.farting and w.state == "play":
                 self.emit_gas(pos, sx, sy)
                 snd = self.sfx[i] if self.sfx else None
