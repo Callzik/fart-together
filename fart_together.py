@@ -1,4 +1,4 @@
-"""Fart Together — кооперативная гонка на надувном плоту.
+"""Fart Together — кооперативная гонка на надувном плоту (3D, Panda3D).
 
 Четыре зверя сидят на круглом плоту и плывут по водной горке.
 Плот толкается только газом: зверь пукает — плот летит в противоположную
@@ -11,255 +11,124 @@ import math
 import os
 import random
 import sys
-
+import tempfile
 import time
+import wave
 
-import pygame
+from panda3d.core import (AmbientLight, AntialiasAttrib, DirectionalLight, Filename, Fog,
+                          KeyboardButton, PNMImage, TextNode, Texture, TextureStage,
+                          TransparencyAttrib, Vec3, Vec4, loadPrcFileData)
 
-import net
+loadPrcFileData("", """
+window-title Fart Together
+win-size 1280 720
+framebuffer-multisample 1
+multisamples 4
+sync-video 1
+""")
 
-W, H = 960, 720
-FPS = 60
-TRACK_LEN = 20000
-RAFT_R = 62
-CHECKPOINT_STEP = 2000
+from direct.gui.DirectGui import DirectFrame  # noqa: E402
+from direct.gui.OnscreenText import OnscreenText  # noqa: E402
+from direct.showbase.ShowBase import ShowBase  # noqa: E402
+
+import gfx  # noqa: E402
+import net  # noqa: E402
+import sim  # noqa: E402
+from gfx import U, to3d  # noqa: E402
+
+if getattr(sys, "frozen", False):
+    HERE = os.path.dirname(sys.executable)
+else:
+    HERE = os.path.dirname(os.path.abspath(__file__))
 SAVE_FILE = os.path.join(os.path.expanduser("~"), ".fart_together.json")
-
-SKY = (150, 205, 245)
-CLIFF = (232, 128, 110)
-CLIFF_DARK = (196, 96, 86)
-WATER = (40, 140, 230)
-WATER_LIGHT = (120, 195, 250)
-RAIL = (80, 210, 190)
-RAIL_DARK = (40, 160, 150)
-RAFT_RING = (250, 205, 160)
-RAFT_FLOOR = (120, 180, 80)
-GAS = (170, 230, 40)
-WHITE = (255, 255, 255)
-BLACK = (20, 20, 30)
-
-ANIMALS = [
-    # name, body colour, belly colour, kind, key, key label
-    ("Лягуха", (110, 190, 60), (190, 230, 120), "frog", pygame.K_q, "Q"),
-    ("Мишаня", (70, 70, 80), (130, 130, 140), "bear", pygame.K_p, "P"),
-    ("Бегемот", (60, 110, 160), (120, 170, 210), "hippo", pygame.K_z, "Z"),
-    ("Мартын", (230, 140, 70), (250, 200, 150), "monkey", pygame.K_m, "M"),
-]
+SEAT_R = 0.64
 
 
-# ---------------------------------------------------------------- track
-def center_x(s):
-    return (260 * math.sin(s / 900.0) + 140 * math.sin(s / 2300.0 + 1.3)
-            + 60 * math.sin(s / 410.0 + 0.4) * min(1.0, s / 3000.0))
-
-
-def half_width(s):
-    if s < 600 or s > TRACK_LEN - 400:
-        return 300
-    return 235 + 55 * math.sin(s / 1300.0 + 0.7)
-
-
-# segments with side walls; between them the edges are open and you can fall
-RAILS = [(-1000, 1800), (3400, 4700), (6500, 7600), (9300, 10200), (12400, 13300),
-         (15200, 16000), (18000, TRACK_LEN + 2000)]
-
-
-def has_rail(s):
-    return any(a <= s <= b for a, b in RAILS)
-
-
-def flow_dir(s):
-    d = (center_x(s + 5) - center_x(s - 5)) / 10.0
-    ln = math.hypot(d, 1)
-    return d / ln, -1 / ln  # world y grows down, track goes up
+def asset(name):
+    return Filename.from_os_specific(os.path.join(HERE, "assets", name)).get_fullpath()
 
 
 # ---------------------------------------------------------------- sound
-def make_fart_sound(seed):
+def write_wav(path, samples, rate=22050):
+    buf = array.array("h", (int(max(-1, min(1, v)) * 32000) for v in samples))
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(buf.tobytes())
+
+
+def fart_samples(seed, rate=22050):
     rnd = random.Random(seed)
-    rate = 22050
     dur = 0.35 + rnd.random() * 0.25
     base = 70 + rnd.random() * 60
-    n = int(rate * dur)
-    buf = array.array("h")
     phase = 0.0
-    for i in range(n):
+    for i in range(int(rate * dur)):
         t = i / rate
         f = base * (1 + 0.35 * math.sin(t * 38 + seed)) * (1 - 0.3 * t / dur)
         phase += f / rate
-        v = 1.0 if (phase % 1.0) < 0.35 else -0.6
-        v += rnd.uniform(-0.5, 0.5)
-        env = min(1.0, t * 40) * (1 - t / dur) ** 1.5
-        s = int(max(-1, min(1, v * env * 0.5)) * 32000)
-        buf.append(s)
-        buf.append(s)
-    return pygame.mixer.Sound(buffer=buf.tobytes())
+        v = (1.0 if (phase % 1.0) < 0.35 else -0.6) + rnd.uniform(-0.5, 0.5)
+        yield v * min(1.0, t * 40) * (1 - t / dur) ** 1.5 * 0.5
 
 
-# ---------------------------------------------------------------- obstacles
-class Hammer:
-    """Swinging hammer: the head sweeps across the track."""
-
-    def __init__(self, s, side, speed, phase):
-        self.s, self.side, self.speed, self.phase = s, side, speed, phase
-        self.r = 46
-
-    def head(self, t):
-        cx, hw = center_x(self.s), half_width(self.s)
-        return cx + hw * 0.9 * math.sin(t * self.speed + self.phase), -self.s
-
-    def pivot(self):
-        cx, hw = center_x(self.s), half_width(self.s)
-        return cx + self.side * (hw + 90), -self.s - 40
-
-    def collide(self, t, p):
-        hx, hy = self.head(t)
-        return hx, hy, self.r
-
-    def draw(self, surf, cam, t):
-        px, py = cam.to_screen(*self.pivot())
-        hx, hy = cam.to_screen(*self.head(t))
-        pygame.draw.line(surf, (240, 120, 40), (px, py), (hx, hy), 16)
-        pygame.draw.circle(surf, (200, 90, 30), (px, py), 18)
-        rect = pygame.Rect(0, 0, 110, 70)
-        rect.center = (hx, hy)
-        pygame.draw.rect(surf, RAIL_DARK, rect.move(0, 6), border_radius=18)
-        pygame.draw.rect(surf, RAIL, rect, border_radius=18)
-        pygame.draw.circle(surf, (250, 100, 30), (hx - 38, hy), 22)
-        pygame.draw.circle(surf, (250, 100, 30), (hx + 38, hy), 22)
+def bonk_samples(rate=22050):
+    for i in range(int(rate * 0.25)):
+        t = i / rate
+        yield 0.6 * math.sin(2 * math.pi * (220 - 300 * t) * t) * (1 - t / 0.25) ** 2
 
 
-class Spinner:
-    """Rotating bar with spikes in the middle of the track."""
-
-    def __init__(self, s, speed, length=0.75):
-        self.s, self.speed, self.len = s, speed, length
-
-    def ends(self, t):
-        cx, hw = center_x(self.s), half_width(self.s)
-        a = t * self.speed
-        L = hw * self.len
-        return (cx - L * math.cos(a), -self.s - L * math.sin(a)), (cx + L * math.cos(a), -self.s + L * math.sin(a))
-
-    def collide(self, t, p):
-        (ax, ay), (bx, by) = self.ends(t)
-        dx, dy = bx - ax, by - ay
-        k = max(0, min(1, ((p[0] - ax) * dx + (p[1] - ay) * dy) / (dx * dx + dy * dy)))
-        return ax + dx * k, ay + dy * k, 16
-
-    def draw(self, surf, cam, t):
-        a, b = self.ends(t)
-        a, b = cam.to_screen(*a), cam.to_screen(*b)
-        pygame.draw.line(surf, (120, 60, 120), (a[0], a[1] + 6), (b[0], b[1] + 6), 22)
-        pygame.draw.line(surf, (220, 80, 200), a, b, 22)
-        for i in range(9):
-            k = i / 8
-            x, y = a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k
-            pygame.draw.circle(surf, WHITE, (int(x), int(y)), 6)
-        c = cam.to_screen(center_x(self.s), -self.s)
-        pygame.draw.circle(surf, (90, 90, 100), c, 20)
+def clock_texture():
+    img = PNMImage(64, 64, 4)
+    img.fill(1, 1, 1)
+    img.alpha_fill(0)
+    for y in range(64):
+        for x in range(64):
+            d = math.hypot(x - 31.5, y - 31.5)
+            if d < 28:
+                img.set_alpha(x, y, 1)
+                ring = d > 22
+                hand = (abs(x - 31.5) < 2.5 and 12 < y < 33) or (abs(y - 31.5) < 2.5 and 30 < x < 46)
+                if not ring and not hand:
+                    img.set_xel(x, y, 0.25, 0.3, 0.4)
+    tex = Texture("clock")
+    tex.load(img)
+    return tex
 
 
-class Mine:
-    """Spiky floating ball drifting from side to side."""
-
-    def __init__(self, s, speed, phase):
-        self.s, self.speed, self.phase = s, speed, phase
-        self.r = 34
-
-    def pos(self, t):
-        cx, hw = center_x(self.s), half_width(self.s)
-        return cx + hw * 0.65 * math.sin(t * self.speed + self.phase), -self.s + 20 * math.sin(t * 2 + self.phase)
-
-    def collide(self, t, p):
-        x, y = self.pos(t)
-        return x, y, self.r
-
-    def draw(self, surf, cam, t):
-        x, y = cam.to_screen(*self.pos(t))
-        for i in range(8):
-            a = i * math.pi / 4 + t
-            tip = (x + math.cos(a) * 50, y + math.sin(a) * 50)
-            l = (x + math.cos(a - 0.3) * 30, y + math.sin(a - 0.3) * 30)
-            r = (x + math.cos(a + 0.3) * 30, y + math.sin(a + 0.3) * 30)
-            pygame.draw.polygon(surf, WHITE, [tip, l, r])
-        pygame.draw.circle(surf, (190, 40, 50), (x, y), self.r)
-        pygame.draw.circle(surf, (90, 170, 140), (x, y + 8), self.r - 6, width=8)
-        pygame.draw.circle(surf, (240, 120, 120), (x - 10, y - 12), 8)
+class Puff:
+    __slots__ = ("np", "pos", "vel", "life", "max", "size")
 
 
-def build_obstacles():
-    rnd = random.Random(7)
-    obs = []
-    s = 1500
-    while s < TRACK_LEN - 900:
-        kind = rnd.choice(["hammer", "hammer", "spinner", "mine", "mine"])
-        if kind == "hammer":
-            obs.append(Hammer(s, rnd.choice([-1, 1]), rnd.uniform(1.2, 2.0), rnd.uniform(0, 6)))
-        elif kind == "spinner":
-            obs.append(Spinner(s, rnd.choice([-1, 1]) * rnd.uniform(0.9, 1.6)))
-        else:
-            obs.append(Mine(s, rnd.uniform(0.6, 1.3), rnd.uniform(0, 6)))
-            if rnd.random() < 0.5:
-                obs.append(Mine(s + 160, rnd.uniform(0.6, 1.3), rnd.uniform(0, 6)))
-        s += rnd.randint(650, 1050)
-    return obs
+class FartApp(ShowBase):
+    def __init__(self, test_keys=None):
+        ShowBase.__init__(self)
+        self.disable_mouse()
+        self.test_keys = test_keys
+        self.set_background_color(*gfx.C_SKY)
+        self.render.set_antialias(AntialiasAttrib.M_multisample)
+        self.render.set_two_sided(True)
+        try:
+            self.font = self.loader.load_font(asset("DejaVuSans-Bold.ttf"))
+            self.font.set_pixels_per_unit(80)
+        except Exception:
+            self.font = None
 
-
-# ---------------------------------------------------------------- game objects
-class Camera:
-    def __init__(self):
-        self.x, self.y = 0.0, 0.0
-        self.shake = 0.0
-
-    def follow(self, x, y, dt):
-        self.x += (x - self.x) * min(1, dt * 4)
-        self.y += (y - H * 0.18 - self.y) * min(1, dt * 6)
-        self.shake = max(0, self.shake - dt * 30)
-
-    def to_screen(self, x, y):
-        sx = random.uniform(-self.shake, self.shake)
-        sy = random.uniform(-self.shake, self.shake)
-        return int(x - self.x + W / 2 + sx), int(y - self.y + H / 2 + sy)
-
-
-class Particle:
-    __slots__ = ("x", "y", "vx", "vy", "life", "max", "r")
-
-    def __init__(self, x, y, vx, vy, life, r):
-        self.x, self.y, self.vx, self.vy, self.life, self.max, self.r = x, y, vx, vy, life, life, r
-
-
-class Seat:
-    def __init__(self, idx, data, sound):
-        self.idx = idx
-        self.name, self.color, self.belly, self.kind, self.key, self.label = data
-        self.gas = 100.0
-        self.empty = False
-        self.farting = False
-        self.sound = sound
-        self.channel = None
-
-
-class Game:
-    def __init__(self, screen):
-        self.screen = screen
-        self.font = pygame.font.SysFont("arial", 18, bold=True)
-        self.small = pygame.font.SysFont("arial", 13, bold=True)
-        self.big = pygame.font.SysFont("arial", 64, bold=True)
-        self.mid = pygame.font.SysFont("arial", 30, bold=True)
-        self.audio = pygame.mixer.get_init() is not None
-        sounds = [make_fart_sound(i) if self.audio else None for i in range(4)]
-        self.seats = [Seat(i, a, sounds[i]) for i, a in enumerate(ANIMALS)]
-        self.best = self.load_best()
-        self.state = "menu"
+        self.world = sim.World()
+        self.world.best = self.load_best()
         self.mode = "solo"
         self.net = None
         self.my_seat = 0
         self.ip_text = ""
         self.net_msg = ""
-        self.new_record = False
-        self.reset()
+        self.ips = []
+        self.shake = 0.0
+        self.cam_pos = None
+
+        self.setup_scene()
+        self.setup_sounds()
+        self.setup_hud()
+        self.setup_input()
+        self.task_mgr.add(self.loop, "loop")
 
     # ------------------------------------------------------------ save
     def load_best(self):
@@ -272,170 +141,326 @@ class Game:
     def save_best(self):
         try:
             with open(SAVE_FILE, "w") as f:
-                json.dump({"best": self.best}, f)
+                json.dump({"best": self.world.best}, f)
         except Exception:
             pass
 
-    # ------------------------------------------------------------ state
-    def reset(self):
-        self.x, self.y = center_x(0), 0.0
-        self.vx, self.vy = 0.0, -60.0
-        self.ang, self.spin = 0.0, 0.0
-        self.t = 0.0
-        self.time = 0.0
-        self.falls = 0
-        self.checkpoint = 0
-        self.falling = 0.0
-        self.hit_cd = 0.0
-        self.particles = []
-        self.obstacles = build_obstacles()
-        self.cam = Camera()
-        self.cam.x, self.cam.y = self.x, self.y - H * 0.18
-        self.countdown = 3.0
-        for s in self.seats:
-            s.gas, s.empty = 100.0, False
-        self.flash = ""
-        self.flash_t = 0.0
+    # ------------------------------------------------------------ scene
+    def setup_scene(self):
+        P = self.protos = gfx.Protos()
+        amb = AmbientLight("amb")
+        amb.set_color(Vec4(0.68, 0.70, 0.76, 1))
+        sun = DirectionalLight("sun")
+        sun.set_color(Vec4(0.72, 0.70, 0.62, 1))
+        sun_np = self.render.attach_new_node(sun)
+        sun_np.set_hpr(35, -55, 0)
+        self.render.set_light(self.render.attach_new_node(amb))
+        self.render.set_light(sun_np)
+        fog = Fog("fog")
+        fog.set_color(*gfx.C_SKY[:3])
+        fog.set_linear_range(28, 80)
+        self.render.set_fog(fog)
 
-    def seat_dir(self, i):
-        a = self.ang + i * math.pi / 2 - math.pi / 2
-        return math.cos(a), math.sin(a)
+        self.static = self.render.attach_new_node("static")
+        self.water = gfx.build_track(self.static)
+        self.water.set_light_off()
+        gfx.build_scenery(self.static)
+        gfx.build_finish(self.static, P, self.font)
+        self.checkpoints = {}
+        for cp in range(sim.CHECKPOINT_STEP, sim.TRACK_LEN, sim.CHECKPOINT_STEP):
+            self.checkpoints[cp] = gfx.build_checkpoint(self.static, P, cp)
+
+        self.obs_nodes = []
+        for ob in self.world.obstacles:
+            if ob.kind == "hammer":
+                root, pivot, L = gfx.build_hammer(self.static, P, ob)
+                self.obs_nodes.append((ob, root, pivot, L))
+            elif ob.kind == "spinner":
+                root, rot = gfx.build_spinner(self.static, P, ob)
+                self.obs_nodes.append((ob, root, rot, None))
+            else:
+                self.obs_nodes.append((ob, gfx.build_mine(self.render, P), None, None))
+
+        self.raft = gfx.build_raft(self.render, P)
+        self.raft.set_scale(1.15)
+        self.animals = []
+        for seat in self.world.seats:
+            a = gfx.build_animal(self.render, P, seat.kind)
+            a.set_scale(1.2)
+            tn = TextNode("name")
+            tn.set_text(seat.name)
+            if self.font:
+                tn.set_font(self.font)
+            tn.set_align(TextNode.A_center)
+            tn.set_text_color(1, 1, 1, 1)
+            tn.set_shadow(0.06, 0.06)
+            tn.set_shadow_color(0.1, 0.15, 0.25, 0.9)
+            lbl = self.render.attach_new_node(tn)
+            lbl.set_scale(0.12)
+            lbl.set_billboard_point_eye()
+            lbl.set_light_off()
+            lbl.set_fog_off()
+            lbl.set_depth_test(False)
+            lbl.set_depth_write(False)
+            lbl.set_bin("fixed", 10)
+            self.animals.append((a, lbl))
+
+        self.puffs, self.puff_pool = [], []
+        for _ in range(260):
+            np_ = P.sphere.copy_to(self.render)
+            np_.set_transparency(TransparencyAttrib.M_alpha)
+            np_.set_light_off()
+            np_.set_depth_write(False)
+            np_.set_bin("transparent", 0)
+            np_.hide()
+            self.puff_pool.append(np_)
+        self.rings, self.ring_pool = [], []
+        ring_proto = gfx.torus(1.0, 0.05, 28, 4, (1, 1, 1, 1))
+        for _ in range(24):
+            r = ring_proto.copy_to(self.render)
+            r.set_transparency(TransparencyAttrib.M_alpha)
+            r.set_light_off()
+            r.set_depth_write(False)
+            r.set_bin("transparent", 0)
+            r.hide()
+            self.ring_pool.append(r)
+        self.ring_timer = 0.0
+
+    def setup_sounds(self):
+        self.sfx, self.bonk = [], None
+        try:
+            d = tempfile.mkdtemp(prefix="fart_together_")
+            for i in range(4):
+                p = os.path.join(d, f"fart{i}.wav")
+                write_wav(p, list(fart_samples(i)))
+                self.sfx.append(self.loader.load_sfx(Filename.from_os_specific(p).get_fullpath()))
+            p = os.path.join(d, "bonk.wav")
+            write_wav(p, list(bonk_samples()))
+            self.bonk = self.loader.load_sfx(Filename.from_os_specific(p).get_fullpath())
+        except Exception:
+            self.sfx = []
+
+    # ------------------------------------------------------------ HUD
+    def text(self, txt="", pos=(0, 0), scale=0.06, parent=None, align=TextNode.A_center):
+        return OnscreenText(text=txt, pos=pos, scale=scale, fg=(1, 1, 1, 1), shadow=(0.05, 0.1, 0.2, 0.8),
+                            align=align, font=self.font, parent=parent or self.aspect2d, mayChange=True)
+
+    def setup_hud(self):
+        self.timer_frame = DirectFrame(frameColor=(0.12, 0.18, 0.28, 0.55), frameSize=(-0.27, 0.27, -0.055, 0.055),
+                                       pos=(0, 0, 0.9), parent=self.aspect2d)
+        clock = DirectFrame(image=clock_texture(), image_scale=0.035, frameColor=(0, 0, 0, 0),
+                            pos=(-0.2, 0, 0), parent=self.timer_frame)
+        clock.set_transparency(TransparencyAttrib.M_alpha)
+        self.timer_text = self.text("00:00.00", (0.04, -0.022), 0.06, self.timer_frame)
+        self.flash_text = self.text("", (0, 0.72), 0.08)
+        self.count_text = self.text("", (0, 0.3), 0.25)
+        self.hint_text = self.text("", (0, -0.79), 0.045)
+
+        self.gas_bars = []
+        for i, seat in enumerate(self.world.seats):
+            fr = DirectFrame(frameColor=(0.12, 0.18, 0.28, 0.6), frameSize=(-0.25, 0.25, -0.05, 0.05),
+                             pos=(-0.84 + i * 0.56, 0, -0.9), parent=self.aspect2d)
+            label = self.text(seat.name, (-0.22, 0.005), 0.042, fr, TextNode.A_left)
+            DirectFrame(frameColor=(0.05, 0.08, 0.15, 0.9), frameSize=(-0.22, 0.22, -0.035, -0.015), parent=fr)
+            bar = DirectFrame(frameColor=gfx.C_GAS, frameSize=(0, 0.44, -0.035, -0.015), pos=(-0.22, 0, 0), parent=fr)
+            self.gas_bars.append((fr, label, bar))
+
+        self.prog_back = DirectFrame(frameColor=(0.12, 0.18, 0.28, 0.55), frameSize=(-0.012, 0.012, -0.6, 0.6),
+                                     pos=(-0.06, 0, 0.05), parent=self.a2dRightCenter)
+        self.prog_bar = DirectFrame(frameColor=gfx.C_GAS, frameSize=(-0.012, 0.012, 0, 1.2),
+                                    pos=(0, 0, -0.6), parent=self.prog_back)
+
+        self.overlay = DirectFrame(frameColor=(0.05, 0.1, 0.22, 0.72), frameSize=(-3, 3, -1, 1), parent=self.aspect2d)
+        self.ov_title = self.text("", (0, 0.55), 0.13, self.overlay)
+        self.ov_lines = [self.text("", (0, 0.35 - i * 0.085), 0.05, self.overlay) for i in range(10)]
+
+    def show_overlay(self, title, lines):
+        self.overlay.show()
+        self.ov_title.setText(title)
+        for i, t in enumerate(self.ov_lines):
+            t.setText(lines[i] if i < len(lines) else "")
+
+    @staticmethod
+    def fmt(t):
+        return f"{int(t // 60):02d}:{t % 60:05.2f}"
+
+    def update_hud(self):
+        w = self.world
+        self.timer_text.setText(self.fmt(w.time))
+        self.flash_text.setText(w.flash if w.flash_t > 0 else "")
+        self.count_text.setText(str(int(math.ceil(w.countdown))) if w.state == "play" and w.countdown > 0 else "")
+        prog = max(0.001, min(1, -w.y / sim.TRACK_LEN))
+        self.prog_bar["frameSize"] = (-0.012, 0.012, 0, 1.2 * prog)
+        online = self.mode in ("host", "client")
+        players = self.players()
+        for i, (fr, label, bar) in enumerate(self.gas_bars):
+            seat = w.seats[i]
+            suffix = ""
+            if self.mode == "coop":
+                suffix = f"  [{seat.key.upper()}]"
+            elif online:
+                suffix = "  (ты)" if i == self.my_seat else ("" if i in players else "  —")
+            label.setText(seat.name + suffix)
+            bar["frameSize"] = (0, 0.44 * max(0.001, seat.gas) / 100, -0.035, -0.015)
+            bar["frameColor"] = (0.9, 0.3, 0.25, 1) if seat.empty else gfx.C_GAS
+            fr["frameColor"] = (0.30, 0.45, 0.15, 0.75) if online and i == self.my_seat else (0.12, 0.18, 0.28, 0.6)
+        self.hint_text.setText("Пробел — пукать" if online and w.state == "play" else "")
+
+        st = w.state
+        if st == "menu":
+            best = f"Рекорд: {self.fmt(w.best)}" if w.best else "Рекорда пока нет"
+            self.show_overlay("FART TOGETHER", [
+                "Плот двигается только газом: зверь пукает, и плот летит от него.",
+                "Не вылетай с горки там, где нет бортиков. Уворачивайся от молотов, крутилок и мин.",
+                "",
+                "1   Соло: стрелки / WASD (нужные звери пукают сами)",
+                "2   Вместе за одной клавиатурой: Q, P, Z, M",
+                "3   Онлайн: создать игру",
+                "4   Онлайн: подключиться",
+                "",
+                best,
+                self.net_msg or "Esc — выход",
+            ])
+        elif st == "pause":
+            self.show_overlay("Пауза", ["", "Esc — продолжить", "R — заново", "Q — в меню"])
+        elif st == "lobby":
+            names = ", ".join(w.seats[i].name for i in self.net.seats_taken())
+            self.show_overlay("Онлайн: ты хост", [
+                "Друзья выбирают «Подключиться» и вводят один из адресов:",
+                "   ".join(f"{ip}:{net.PORT}" for ip in self.ips),
+                "Через интернет: Radmin VPN / ZeroTier / playit.gg (см. README)",
+                "",
+                f"Игроки ({len(self.net.seats_taken())}/4): {names}",
+                "",
+                "Enter — старт, Esc — отмена",
+            ])
+        elif st == "join":
+            cursor = "_" if int(time.monotonic() * 2) % 2 else " "
+            self.show_overlay("Подключиться", [
+                "Введи адрес хоста (например 192.168.1.5 или 26.10.20.30:5555):",
+                "",
+                self.ip_text + cursor,
+                "",
+                "Enter — подключиться, Esc — назад",
+            ])
+        elif st == "joining":
+            c = self.net
+            line = "Подключаюсь..." if c.seat is None else f"Ты — {w.seats[c.seat].name}. Ждём, пока хост нажмёт старт"
+            self.show_overlay("Онлайн", [line, "", "Esc — выйти"])
+        elif st == "finish":
+            lines = [f"Время: {self.fmt(w.time)}", f"Падений: {w.falls}"]
+            if w.new_record:
+                lines.append("Новый рекорд!")
+            lines.append("")
+            if self.mode == "client":
+                lines += ["Ждём, пока хост начнёт заново", "Esc — выйти"]
+            else:
+                lines += ["Enter — ещё раз", "Esc — в меню"]
+            self.show_overlay("ФИНИШ!", lines)
+        else:
+            self.overlay.hide()
 
     # ------------------------------------------------------------ input
-    def local_fart(self, keys):
-        return bool(keys[pygame.K_SPACE] or keys[self.seats[self.my_seat].key])
+    def setup_input(self):
+        self.accept("keystroke", self.on_char)
+        for key in ("escape", "enter", "backspace", "1", "2", "3", "4", "r", "q"):
+            self.accept(key, self.on_key, [key])
 
-    def wanted_farts(self, keys):
+    def down(self, name):
+        if self.test_keys is not None:
+            return name in self.test_keys
+        mw = self.mouseWatcherNode
+        if mw is None:
+            return False
+        btn = {"left": KeyboardButton.left(), "right": KeyboardButton.right(), "up": KeyboardButton.up(),
+               "down": KeyboardButton.down(), "space": KeyboardButton.space()}.get(name)
+        return mw.is_button_down(btn or KeyboardButton.ascii_key(name))
+
+    def players(self):
+        if self.mode == "host" and self.net:
+            return self.net.seats_taken()
+        if self.mode == "client" and self.net and self.net.state:
+            return self.net.state.get("pl", [])
+        return [0, 1, 2, 3]
+
+    def local_fart(self):
+        return self.down("space") or self.down(self.world.seats[self.my_seat].key)
+
+    def wanted(self):
+        w = self.world
         if self.mode == "host":
             res = [bool(v) for v in self.net.inputs]
-            res[0] = self.local_fart(keys)
+            res[0] = self.local_fart()
             return res
         if self.mode == "coop":
-            return [keys[s.key] for s in self.seats]
-        dx = (keys[pygame.K_RIGHT] or keys[pygame.K_d]) - (keys[pygame.K_LEFT] or keys[pygame.K_a])
-        dy = (keys[pygame.K_DOWN] or keys[pygame.K_s]) - (keys[pygame.K_UP] or keys[pygame.K_w])
-        if not dx and not dy:
-            return [False] * 4
-        ln = math.hypot(dx, dy)
-        dx, dy = dx / ln, dy / ln
-        res = []
-        for i in range(4):
-            sx, sy = self.seat_dir(i)
-            # gas pushes the raft away from the animal: thrust = -seat_dir
-            res.append(-sx * dx - sy * dy > 0.38)
-        return res
+            return [self.down(s.key) for s in w.seats]
+        dx = (self.down("right") or self.down("d")) - (self.down("left") or self.down("a"))
+        dy = (self.down("down") or self.down("s")) - (self.down("up") or self.down("w"))
+        return w.auto_farts(dx, dy)
 
-    # ------------------------------------------------------------ update
-    def update(self, dt, keys):
-        self.t += dt
-        if self.flash_t > 0:
-            self.flash_t -= dt
-        self.update_particles(dt)
+    def on_char(self, ch):
+        if self.world.state == "join" and (ch.isalnum() or ch in ".:-"):
+            self.ip_text = (self.ip_text + ch)[:60]
+
+    def start(self, mode):
+        self.mode = mode
+        self.world.reset()
+        self.world.state = "play"
+        self.clear_fx()
+
+    def on_key(self, key):
+        w = self.world
+        st = w.state
         if self.mode == "client":
-            self.client_update(dt, keys)
+            if key == "escape":
+                self.leave_online()
             return
-        if self.state != "play":
-            for s in self.seats:
-                self.stop_sound(s)
-            return
-        if self.countdown > 0:
-            self.countdown -= dt
-            self.cam.follow(self.x, self.y, dt)
-            return
-        self.time += dt
-
-        if self.falling > 0:
-            self.falling -= dt
-            if self.falling <= 0:
-                self.respawn()
-            self.cam.follow(self.x, self.y, dt)
-            return
-
-        s = -self.y
-        fx, fy = flow_dir(s)
-        current = 230 + 60 * min(1, s / 6000)
-        ax = (fx * current - self.vx) * 0.9
-        ay = (fy * current - self.vy) * 0.9
-
-        want = self.wanted_farts(keys)
-        for i, seat in enumerate(self.seats):
-            on = want[i] and not seat.empty
-            seat.farting = on
-            if on:
-                seat.gas -= 55 * dt
-                if seat.gas <= 0:
-                    seat.gas, seat.empty = 0, True
-                sx, sy = self.seat_dir(i)
-                ax += -sx * 900
-                ay += -sy * 900
-                self.spin += (1 if i % 2 else -1) * 0.9 * dt
-                self.spawn_gas(i)
-                self.play_sound(seat)
-            else:
-                seat.gas = min(100, seat.gas + 22 * dt)
-                if seat.empty and seat.gas > 30:
-                    seat.empty = False
-                self.stop_sound(seat)
-
-        self.vx += ax * dt
-        self.vy += ay * dt
-        self.x += self.vx * dt
-        self.y += self.vy * dt
-        self.spin *= (1 - 0.8 * dt)
-        self.spin += (random.random() - 0.5) * 0.4 * dt
-        self.ang += self.spin * dt
-
-        s = -self.y
-        if s < -200:
-            self.y = 200
-            self.vy = abs(self.vy) * -0.5
-        cx, hw = center_x(s), half_width(s)
-        off = self.x - cx
-        if abs(off) > hw - RAFT_R * 0.6:
-            if has_rail(s):
-                side = 1 if off > 0 else -1
-                self.x = cx + side * (hw - RAFT_R * 0.6)
-                if self.vx * side > 0:
-                    self.vx = -self.vx * 0.6
-                    self.spin += side * 1.5
-            elif abs(off) > hw + 10:
-                self.start_fall()
-
-        if self.hit_cd > 0:
-            self.hit_cd -= dt
-        for ob in self.obstacles:
-            if abs(ob.s - s) > 400:
-                continue
-            ox, oy, r = ob.collide(self.t, (self.x, self.y))
-            dx, dy = self.x - ox, self.y - oy
-            d = math.hypot(dx, dy)
-            if d < r + RAFT_R and d > 0.01:
-                nx, ny = dx / d, dy / d
-                self.x, self.y = ox + nx * (r + RAFT_R), oy + ny * (r + RAFT_R)
-                if self.hit_cd <= 0:
-                    self.vx += nx * 650
-                    self.vy += ny * 650
-                    self.spin += random.choice([-1, 1]) * 4
-                    self.cam.shake = 10
-                    self.hit_cd = 0.35
-
-        cp = int(max(0, s) // CHECKPOINT_STEP) * CHECKPOINT_STEP
-        if cp > self.checkpoint:
-            self.checkpoint = cp
-            self.say("Чекпоинт!")
-        if s >= TRACK_LEN:
-            self.finish()
-        self.cam.follow(self.x, self.y, dt)
-
-    def spawn_gas(self, i):
-        sx, sy = self.seat_dir(i)
-        bx, by = self.x + sx * RAFT_R, self.y + sy * RAFT_R
-        for _ in range(3):
-            sp = random.uniform(150, 320)
-            a = math.atan2(sy, sx) + random.uniform(-0.5, 0.5)
-            self.particles.append(Particle(bx, by, math.cos(a) * sp + self.vx * 0.5,
-                                           math.sin(a) * sp + self.vy * 0.5,
-                                           random.uniform(0.4, 0.9), random.uniform(8, 16)))
+        if st == "join":
+            if key == "backspace":
+                self.ip_text = self.ip_text[:-1]
+            elif key == "enter" and self.ip_text.strip():
+                self.start_join()
+            elif key == "escape":
+                w.state = "menu"
+        elif st == "lobby":
+            if key == "enter":
+                self.start("host")
+            elif key == "escape":
+                self.leave_online()
+        elif st == "menu":
+            if key == "1":
+                self.start("solo")
+            elif key == "2":
+                self.start("coop")
+            elif key == "3":
+                self.start_host()
+            elif key == "4":
+                w.state = "join"
+            elif key == "escape":
+                self.user_exit()
+        elif st == "play":
+            if key == "escape":
+                if self.mode == "host":
+                    self.leave_online()
+                else:
+                    w.state = "pause"
+        elif st == "pause":
+            if key == "escape":
+                w.state = "play"
+            elif key == "r":
+                self.start(self.mode)
+            elif key == "q":
+                w.reset()
+                w.state = "menu"
+        elif st == "finish":
+            if key == "enter":
+                self.start(self.mode)
+            elif key == "escape":
+                if self.mode == "host":
+                    self.leave_online()
+                else:
+                    w.reset()
+                    w.state = "menu"
 
     # ------------------------------------------------------------ online
     def start_host(self):
@@ -446,14 +471,14 @@ class Game:
             return
         self.mode, self.my_seat, self.net_msg = "host", 0, ""
         self.ips = net.local_ips()
-        self.reset()
-        self.state = "lobby"
+        self.world.reset()
+        self.world.state = "lobby"
 
     def start_join(self):
         self.net = net.Client(self.ip_text)
         self.mode, self.net_msg = "client", ""
-        self.reset()
-        self.state = "joining"
+        self.world.reset()
+        self.world.state = "joining"
 
     def leave_online(self, msg=""):
         if self.net:
@@ -461,485 +486,189 @@ class Game:
         self.net = None
         self.mode, self.my_seat = "solo", 0
         self.net_msg = msg
-        self.reset()
-        self.state = "menu"
+        self.world.reset()
+        self.world.state = "menu"
 
-    def snapshot(self):
-        return {
-            "type": "state", "st": self.state, "x": round(self.x, 1), "y": round(self.y, 1),
-            "vx": round(self.vx, 1), "vy": round(self.vy, 1), "a": round(self.ang, 3),
-            "sp": round(self.spin, 3), "t": round(self.t, 3), "tm": round(self.time, 2),
-            "fl": round(self.falling, 2), "cp": self.checkpoint, "falls": self.falls,
-            "cd": round(self.countdown, 2), "fs": self.flash, "ft": round(self.flash_t, 2),
-            "nr": self.new_record, "pl": self.net.seats_taken(),
-            "g": [[round(st.gas, 1), st.empty, st.farting] for st in self.seats],
-        }
+    # ------------------------------------------------------------ frame
+    def loop(self, task):
+        self.tick(min(globalClock.get_dt(), 1 / 30))  # noqa: F821
+        return task.cont
 
-    def net_tick(self):
-        if self.mode == "host" and self.net:
-            self.net.broadcast(self.snapshot())
-
-    def client_update(self, dt, keys):
-        c = self.net
-        if c.error:
-            self.leave_online(c.error)
-            return
-        if c.seat is not None:
-            self.my_seat = c.seat
-        st = c.state
-        if st is None:
-            return
-        age = min(0.25, time.monotonic() - c.state_time)
-        self.state = {"lobby": "joining"}.get(st["st"], st["st"])
-        self.players = st["pl"]
-        self.vx, self.vy, self.spin = st["vx"], st["vy"], st["sp"]
-        moving = st["st"] == "play" and st["cd"] <= 0 and st["fl"] <= 0
-        tx = st["x"] + (self.vx * age if moving else 0)
-        ty = st["y"] + (self.vy * age if moving else 0)
-        if math.hypot(tx - self.x, ty - self.y) > 200:
-            self.x, self.y = tx, ty
-        else:
-            self.x += (tx - self.x) * min(1, dt * 15)
-            self.y += (ty - self.y) * min(1, dt * 15)
-        self.ang = st["a"] + (self.spin * age if moving else 0)
-        self.t = st["t"] + age
-        self.time, self.falling, self.checkpoint = st["tm"], st["fl"], st["cp"]
-        self.falls, self.countdown, self.new_record = st["falls"], st["cd"], st["nr"]
-        self.flash, self.flash_t = st["fs"], st["ft"]
-        for i, (gas, empty, farting) in enumerate(st["g"]):
-            seat = self.seats[i]
-            seat.gas, seat.empty, seat.farting = gas, empty, farting
-            if farting and self.state == "play":
-                self.spawn_gas(i)
-                self.play_sound(seat)
-        c.send_input(self.local_fart(keys) if self.state == "play" else False)
-        self.cam.follow(self.x, self.y, dt)
-
-    def update_particles(self, dt):
-        alive = []
-        for p in self.particles:
-            p.life -= dt
-            if p.life > 0:
-                p.x += p.vx * dt
-                p.y += p.vy * dt
-                p.vx *= 1 - 2.5 * dt
-                p.vy *= 1 - 2.5 * dt
-                p.r += 18 * dt
-                alive.append(p)
-        self.particles = alive[-600:]
-
-    def play_sound(self, seat):
-        if not self.audio or seat.sound is None:
-            return
-        if seat.channel is None or not seat.channel.get_busy():
-            seat.channel = seat.sound.play()
-
-    def stop_sound(self, seat):
-        seat.farting = False
-
-    def say(self, text):
-        self.flash, self.flash_t = text, 1.4
-
-    def start_fall(self):
-        self.falling = 1.0
-        self.falls += 1
-        self.say("Плюх! +3 сек")
-        self.time += 3
-
-    def respawn(self):
-        s = max(0, self.checkpoint)
-        self.x, self.y = center_x(s), -s
-        fx, fy = flow_dir(s)
-        self.vx, self.vy = fx * 80, fy * 80
-        self.spin = 0
-
-    def finish(self):
-        self.state = "finish"
-        self.new_record = self.best is None or self.time < self.best
-        if self.new_record:
-            self.best = self.time
-            self.save_best()
-
-    # ------------------------------------------------------------ draw
-    def draw(self):
-        surf = self.screen
-        surf.fill(CLIFF)
-        self.draw_track(surf)
-        for ob in self.obstacles:
-            if abs(ob.s + self.cam.y) < H + 300:
-                ob.draw(surf, self.cam, self.t)
-        self.draw_finish(surf)
-        self.draw_particles(surf, behind=True)
-        self.draw_raft(surf)
-        self.draw_hud(surf)
-        if self.state == "menu":
-            self.draw_menu(surf)
-        elif self.state == "finish":
-            self.draw_finish_screen(surf)
-        elif self.state == "pause":
-            self.overlay(surf, ["Пауза", "", "Esc — продолжить", "R — заново", "Q — в меню"])
-        elif self.state == "lobby":
-            names = ", ".join(self.seats[i].name for i in self.net.seats_taken())
-            self.overlay(surf, [
-                "Онлайн: ты хост",
-                "Друзья выбирают «Подключиться» и вводят один из адресов:",
-                "   ".join(f"{ip}:{net.PORT}" for ip in self.ips),
-                "Через интернет: Radmin VPN / ZeroTier / playit.gg (см. README)",
-                "",
-                f"Игроки ({len(self.net.seats_taken())}/4): {names}",
-                "",
-                "Enter — старт, Esc — отмена",
-            ])
-        elif self.state == "join":
-            cursor = "_" if int(self.t * 2) % 2 else " "
-            self.overlay(surf, [
-                "Подключиться",
-                "Введи адрес хоста (например 192.168.1.5 или 26.10.20.30:5555):",
-                self.ip_text + cursor,
-                "",
-                "Enter — подключиться, Esc — назад",
-            ])
-        elif self.state == "joining":
+    def tick(self, dt):
+        w = self.world
+        if self.mode == "client":
             c = self.net
-            if c.seat is None:
-                line = "Подключаюсь..."
+            if c.error:
+                self.leave_online(c.error)
             else:
-                line = f"Ты — {self.seats[c.seat].name}. Ждём, пока хост нажмёт старт"
-            self.overlay(surf, ["Онлайн", line, "", "Esc — выйти"])
+                if c.seat is not None:
+                    self.my_seat = c.seat
+                if c.state is not None:
+                    w.apply_snapshot(c.state, min(0.25, time.monotonic() - c.state_time), dt)
+                    if w.state == "lobby":
+                        w.state = "joining"
+                c.send_input(self.local_fart() if w.state == "play" else False)
+        else:
+            was = w.state
+            w.update(dt, self.wanted())
+            if was == "play" and w.state == "finish" and w.new_record:
+                self.save_best()
+            if self.mode == "host" and self.net:
+                self.net.broadcast(w.snapshot(self.net.seats_taken()))
+        self.update_scene(dt)
+        self.update_hud()
 
-    def edge_points(self):
-        top = self.cam.y - H / 2 - 80
-        bot = self.cam.y + H / 2 + 80
-        pts = []
-        y = bot
-        while y > top:
-            s = -y
-            pts.append((s, center_x(s), half_width(s), y))
-            y -= 14
-        return pts
+    def clear_fx(self):
+        for p in self.puffs:
+            p.np.hide()
+            self.puff_pool.append(p.np)
+        self.puffs = []
+        for r in self.rings:
+            r[0].hide()
+            self.ring_pool.append(r[0])
+        self.rings = []
 
-    def draw_track(self, surf):
-        pts = self.edge_points()
-        if len(pts) < 2:
-            return
-        cam = self.cam
-        # cliff shadows under open edges
-        for i in range(len(pts) - 1):
-            s, cx, hw, y = pts[i]
-            s2, cx2, hw2, y2 = pts[i + 1]
-            for side in (-1, 1):
-                a = cam.to_screen(cx + side * hw, y)
-                b = cam.to_screen(cx2 + side * hw2, y2)
-                c = cam.to_screen(cx2 + side * (hw2 + 70), y2 + 40)
-                d = cam.to_screen(cx + side * (hw + 70), y + 40)
-                pygame.draw.polygon(surf, CLIFF_DARK, [a, b, c, d])
-        left = [cam.to_screen(cx - hw, y) for s, cx, hw, y in pts]
-        right = [cam.to_screen(cx + hw, y) for s, cx, hw, y in pts]
-        pygame.draw.polygon(surf, WATER, left + right[::-1])
-        # flow lines
-        for lane in range(-3, 4):
-            k = lane / 3.6
-            for i in range(0, len(pts) - 1):
-                s, cx, hw, y = pts[i]
-                phase = (s + self.t * 260 + lane * 97) % 220
-                if phase < 90:
-                    s2, cx2, hw2, y2 = pts[i + 1]
-                    a = cam.to_screen(cx + hw * k, y)
-                    b = cam.to_screen(cx2 + hw2 * k, y2)
-                    pygame.draw.line(surf, WATER_LIGHT, a, b, 3)
-        # rails
-        for i in range(len(pts) - 1):
-            s, cx, hw, y = pts[i]
-            s2, cx2, hw2, y2 = pts[i + 1]
-            for side in (-1, 1):
-                a = cam.to_screen(cx + side * hw, y)
-                b = cam.to_screen(cx2 + side * hw2, y2)
-                if has_rail(s):
-                    pygame.draw.line(surf, RAIL_DARK, (a[0], a[1] + 6), (b[0], b[1] + 6), 16)
-                    pygame.draw.line(surf, RAIL, a, b, 14)
-                else:
-                    pygame.draw.line(surf, (230, 245, 255), a, b, 4)
-        # checkpoints
-        for cp in range(CHECKPOINT_STEP, TRACK_LEN, CHECKPOINT_STEP):
-            if abs(-cp - cam.y) < H:
-                cx, hw = center_x(cp), half_width(cp)
-                a = cam.to_screen(cx - hw, -cp)
-                b = cam.to_screen(cx + hw, -cp)
-                col = (255, 230, 90) if cp <= self.checkpoint else (255, 255, 255)
-                for k in range(0, 20, 2):
-                    p = (a[0] + (b[0] - a[0]) * k / 20, a[1])
-                    q = (a[0] + (b[0] - a[0]) * (k + 1) / 20, a[1])
-                    pygame.draw.line(surf, col, p, q, 5)
+    def raft_pos(self):
+        w = self.world
+        p = to3d(w.x, w.y, 0.04 + 0.03 * math.sin(w.t * 3.1))
+        if w.falling > 0:
+            k = 1.2 - w.falling
+            p += Vec3(w.fall_dir * k * 2.5, k * 1.5, -9 * k * k)
+        return p
 
-    def draw_finish(self, surf):
-        s = TRACK_LEN
-        if abs(-s - self.cam.y) > H:
-            return
-        cx, hw = center_x(s), half_width(s)
-        a = self.cam.to_screen(cx - hw - 20, -s)
-        b = self.cam.to_screen(cx + hw + 20, -s)
-        sq = 30
-        n = int((b[0] - a[0]) / sq)
-        for i in range(n):
-            for j in range(2):
-                col = WHITE if (i + j) % 2 == 0 else BLACK
-                pygame.draw.rect(surf, col, (a[0] + i * sq, a[1] + j * sq - sq, sq, sq))
-        pygame.draw.rect(surf, (200, 150, 60), (a[0] - 20, a[1] - 140, 30, 170))
-        pygame.draw.rect(surf, (200, 150, 60), (b[0] - 10, b[1] - 140, 30, 170))
-        banner = pygame.Rect(a[0], a[1] - 150, b[0] - a[0], 56)
-        pygame.draw.rect(surf, (230, 180, 60), banner, border_radius=8)
-        txt = self.mid.render("FINISH", True, (190, 40, 50))
-        surf.blit(txt, txt.get_rect(center=banner.center))
+    def update_scene(self, dt):
+        w = self.world
+        t = w.t
+        here = -w.y
+        for ob, root, mover, L in self.obs_nodes:
+            if abs(ob.s - here) > 8000:
+                continue
+            if ob.kind == "hammer":
+                d = (ob.head(t)[0] - sim.center_x(ob.s)) / U
+                mover.set_r(-math.degrees(math.asin(max(-0.99, min(0.99, d / L)))))
+            elif ob.kind == "spinner":
+                mover.set_h(-math.degrees(ob.angle(t)))
+            else:
+                x, y = ob.pos(t)
+                root.set_pos(to3d(x, y, 0.02 + 0.04 * math.sin(t * 2.5 + ob.phase)))
+                root.set_h(t * 20)
+        for cp, (root, parts) in self.checkpoints.items():
+            col = (1.0, 0.85, 0.25, 1) if cp <= w.checkpoint else (1, 1, 1, 1)
+            for p in parts:
+                p.set_color(*col)
+        # вода течёт навстречу движению
+        self.water.set_tex_offset(TextureStage.get_default(), 0, t * 0.75)
 
-    def draw_particles(self, surf, behind):
-        for p in self.particles:
+        pos = self.raft_pos()
+        self.raft.set_pos(pos)
+        self.raft.set_h(-math.degrees(w.ang))
+        self.raft.set_p(2.5 * math.sin(t * 2.3))
+        self.raft.set_r(2.5 * math.sin(t * 1.7 + 1))
+        players = self.players()
+        for i, (a, lbl) in enumerate(self.animals):
+            sx, sy = w.seat_dir(i)
+            seat = w.seats[i]
+            bob = 0.04 * abs(math.sin(t * 30)) if seat.farting else 0.0
+            a.set_pos(pos + Vec3(sx * SEAT_R, -sy * SEAT_R, 0.12 + bob))
+            a.set_h(math.degrees(math.atan2(sx, sy)))
+            lbl.set_pos(pos + Vec3(sx * SEAT_R * 1.1, -sy * SEAT_R * 1.1, 1.0))
+            lbl.node().set_text_color(1, 1, 1, 1 if i in players else 0.35)
+            if seat.farting and w.state == "play":
+                self.emit_gas(pos, sx, sy)
+                snd = self.sfx[i] if self.sfx else None
+                if snd and snd.status() != snd.PLAYING:
+                    snd.set_play_rate(random.uniform(0.85, 1.2))
+                    snd.play()
+        for ev in w.events:
+            if ev == "hit":
+                self.shake = 0.35
+                if self.bonk:
+                    self.bonk.play()
+        w.events.clear()
+
+        if w.state == "play" and w.falling <= 0 and w.countdown <= 0:
+            self.ring_timer -= dt
+            if self.ring_timer <= 0 and self.ring_pool:
+                self.ring_timer = 0.22
+                r = self.ring_pool.pop()
+                r.show()
+                r.set_pos(to3d(w.x, w.y, 0.03))
+                self.rings.append([r, 0.0])
+        alive = []
+        for r in self.rings:
+            r[1] += dt
+            k = r[1] / 1.6
+            if k >= 1:
+                r[0].hide()
+                self.ring_pool.append(r[0])
+                continue
+            r[0].set_scale(0.7 + 0.6 * k, 0.7 + 0.6 * k, 1)
+            r[0].set_color(1, 1, 1, 0.65 * (1 - k))
+            alive.append(r)
+        self.rings = alive
+
+        keep = []
+        for p in self.puffs:
+            p.life -= dt
+            if p.life <= 0:
+                p.np.hide()
+                self.puff_pool.append(p.np)
+                continue
+            p.pos += p.vel * dt
+            p.vel *= (1 - 2.2 * dt)
+            p.vel.z += 0.4 * dt
             k = p.life / p.max
-            fade = (190, 235, 160)
-            col = tuple(int(GAS[i] * k + fade[i] * (1 - k)) for i in range(3))
-            pygame.draw.circle(surf, col, self.cam.to_screen(p.x, p.y), int(p.r))
+            p.size = min(0.45, p.size + dt * 0.35)
+            p.np.set_pos(p.pos)
+            p.np.set_scale(p.size)
+            p.np.set_color(gfx.C_GAS[0] + (1 - k) * 0.2, gfx.C_GAS[1], gfx.C_GAS[2] + (1 - k) * 0.3, 0.9 * k ** 0.7)
+            keep.append(p)
+        self.puffs = keep
 
-    def draw_raft(self, surf):
-        scale = 1.0
-        if self.falling > 0:
-            scale = max(0.05, self.falling)
-        c = self.cam.to_screen(self.x, self.y)
-        R = int(RAFT_R * scale)
-        pygame.draw.circle(surf, (20, 90, 160), (c[0], c[1] + 10), R + 6)
-        pygame.draw.circle(surf, RAFT_RING, c, R + 6)
-        pygame.draw.circle(surf, RAFT_FLOOR, c, int(R * 0.78))
-        for k in range(-2, 3):
-            a = self.ang + math.pi / 4
-            ox, oy = math.cos(a) * k * R * 0.28, math.sin(a) * k * R * 0.28
-            dx, dy = -math.sin(a) * R * 0.7, math.cos(a) * R * 0.7
-            pygame.draw.line(surf, (95, 150, 60), (c[0] + ox - dx, c[1] + oy - dy), (c[0] + ox + dx, c[1] + oy + dy), 2)
-        for i in range(4):
-            a = self.ang + i * math.pi / 2 + math.pi / 4
-            hx, hy = c[0] + math.cos(a) * (R + 3), c[1] + math.sin(a) * (R + 3)
-            pygame.draw.circle(surf, (180, 70, 60), (int(hx), int(hy)), max(2, int(8 * scale)))
-        for i, seat in enumerate(self.seats):
-            sx, sy = self.seat_dir(i)
-            px, py = c[0] + sx * R * 0.72, c[1] + sy * R * 0.72
-            self.draw_animal(surf, seat, px, py, math.atan2(-sy, -sx), scale)
+        self.update_camera(dt, pos)
 
-    def draw_animal(self, surf, seat, x, y, face, scale):
-        r = 22 * scale
-        if seat.farting:
-            r *= 1 + 0.08 * math.sin(self.t * 40)
-        fx, fy = math.cos(face), math.sin(face)
-        px, py = -fy, fx
-        x, y = int(x), int(y)
-        if seat.kind == "bear":
-            for s in (-1, 1):
-                pygame.draw.circle(surf, seat.color, (int(x + fx * r * 0.5 + px * s * r * 0.7), int(y + fy * r * 0.5 + py * s * r * 0.7)), int(r * 0.4))
-        if seat.kind == "monkey":
-            for s in (-1, 1):
-                pygame.draw.circle(surf, seat.belly, (int(x + px * s * r), int(y + py * s * r)), int(r * 0.35))
-        pygame.draw.circle(surf, seat.color, (x, y), int(r))
-        hx, hy = x + fx * r * 0.45, y + fy * r * 0.45
-        if seat.kind == "frog":
-            for s in (-1, 1):
-                ex, ey = int(hx + px * s * r * 0.45), int(hy + py * s * r * 0.45)
-                pygame.draw.circle(surf, seat.color, (ex, ey), int(r * 0.35))
-                pygame.draw.circle(surf, WHITE, (ex, ey), int(r * 0.22))
-                pygame.draw.circle(surf, BLACK, (int(ex + fx * 2), int(ey + fy * 2)), max(1, int(r * 0.1)))
-        else:
-            pygame.draw.circle(surf, seat.belly, (int(hx + fx * r * 0.2), int(hy + fy * r * 0.2)), int(r * 0.42))
-            for s in (-1, 1):
-                ex, ey = int(hx + px * s * r * 0.3 - fx * r * 0.1), int(hy + py * s * r * 0.3 - fy * r * 0.1)
-                pygame.draw.circle(surf, WHITE, (ex, ey), max(1, int(r * 0.15)))
-                pygame.draw.circle(surf, BLACK, (ex, ey), max(1, int(r * 0.08)))
-        if scale > 0.6:
-            lbl = self.small.render(seat.name, True, WHITE)
-            surf.blit(lbl, lbl.get_rect(center=(int(x - fx * 30), int(y - fy * 30))))
+    def emit_gas(self, pos, sx, sy):
+        out = Vec3(sx, -sy, 0)
+        w = self.world
+        base = pos + out * (SEAT_R + 0.2) + Vec3(0, 0, 0.2)
+        for _ in range(2):
+            if not self.puff_pool:
+                return
+            p = Puff()
+            p.np = self.puff_pool.pop()
+            p.np.show()
+            spread = Vec3(random.uniform(-0.6, 0.6), random.uniform(-0.6, 0.6), random.uniform(-0.1, 0.4))
+            p.pos = Vec3(base)
+            p.vel = out * random.uniform(2.0, 3.8) + spread + Vec3(w.vx / U * 0.5, -w.vy / U * 0.5, 0)
+            p.life = p.max = random.uniform(0.6, 1.1)
+            p.size = random.uniform(0.09, 0.16)
+            self.puffs.append(p)
 
-    def draw_hud(self, surf):
-        t = self.time
-        txt = self.mid.render(f"{int(t // 60):02d}:{t % 60:05.2f}", True, WHITE)
-        box = txt.get_rect(center=(W / 2, 28)).inflate(30, 10)
-        pygame.draw.rect(surf, (30, 60, 110), box, border_radius=12)
-        surf.blit(txt, txt.get_rect(center=box.center))
-        # progress
-        prog = max(0, min(1, -self.y / TRACK_LEN))
-        bar = pygame.Rect(W - 34, 80, 14, H - 200)
-        pygame.draw.rect(surf, (30, 60, 110), bar, border_radius=7)
-        fill = bar.copy()
-        fill.height = int(bar.height * prog)
-        fill.bottom = bar.bottom
-        pygame.draw.rect(surf, GAS, fill, border_radius=7)
-        # gas bars
-        for i, seat in enumerate(self.seats):
-            x = 20 + i * 180
-            y = H - 50
-            pygame.draw.rect(surf, (30, 60, 110), (x, y, 165, 36), border_radius=10)
-            pygame.draw.circle(surf, seat.color, (x + 18, y + 18), 12)
-            key = seat.label if self.mode == "coop" else ""
-            if self.mode in ("host", "client"):
-                if i == self.my_seat:
-                    key = "(ты)"
-                    pygame.draw.rect(surf, GAS, (x - 2, y - 2, 169, 40), width=3, border_radius=11)
-                elif i not in getattr(self, "players", [0]) and not (self.mode == "host" and i in self.net.seats_taken()):
-                    key = "—"
-            lbl = self.font.render(f"{seat.name} {key}", True, WHITE)
-            surf.blit(lbl, (x + 36, y + 2))
-            g = pygame.Rect(x + 36, y + 24, 120, 7)
-            pygame.draw.rect(surf, (15, 30, 60), g, border_radius=3)
-            g2 = g.copy()
-            g2.width = int(g.width * seat.gas / 100)
-            pygame.draw.rect(surf, (220, 80, 60) if seat.empty else GAS, g2, border_radius=3)
-        if self.flash_t > 0:
-            t = self.mid.render(self.flash, True, WHITE)
-            surf.blit(t, t.get_rect(center=(W / 2, 90)))
-        if self.mode in ("host", "client") and self.state == "play":
-            t = self.small.render("Пробел — пукать (Esc — выйти из онлайна)", True, WHITE)
-            surf.blit(t, (20, H - 72))
-        if self.state == "play" and self.countdown > 0:
-            n = int(math.ceil(self.countdown))
-            t = self.big.render(str(n), True, WHITE)
-            surf.blit(t, t.get_rect(center=(W / 2, H / 2 - 120)))
-
-    def overlay(self, surf, lines):
-        shade = pygame.Surface((W, H), pygame.SRCALPHA)
-        shade.fill((10, 20, 50, 170))
-        surf.blit(shade, (0, 0))
-        y = H / 2 - len(lines) * 22
-        for i, line in enumerate(lines):
-            f = self.big if i == 0 else self.font
-            t = f.render(line, True, WHITE)
-            surf.blit(t, t.get_rect(center=(W / 2, y)))
-            y += 80 if i == 0 else 30
-
-    def draw_menu(self, surf):
-        best = f"Рекорд: {int(self.best // 60):02d}:{self.best % 60:05.2f}" if self.best else "Рекорда пока нет"
-        self.overlay(surf, [
-            "FART TOGETHER",
-            "Плот двигается только газом: зверь пукает — плот летит от него.",
-            "Не вылетай с горки там, где нет бортиков. Уворачивайся от молотов, крутилок и мин.",
-            "",
-            "1 — Соло: стрелки / WASD (нужные звери пукают сами)",
-            "2 — Вместе на одной клавиатуре: Лягуха Q, Мишаня P, Бегемот Z, Мартын M",
-            "3 — Онлайн: создать игру        4 — Онлайн: подключиться",
-            "",
-            best,
-            self.net_msg,
-            "Esc — пауза / выход",
-        ])
-
-    def draw_finish_screen(self, surf):
-        t = self.time
-        lines = ["ФИНИШ!", f"Время: {int(t // 60):02d}:{t % 60:05.2f}", f"Падений: {self.falls}"]
-        if self.new_record:
-            lines.append("Новый рекорд!")
-        if self.mode == "client":
-            lines += ["", "Ждём, пока хост начнёт заново", "Esc — выйти"]
-        else:
-            lines += ["", "Enter — ещё раз", "Esc — в меню"]
-        self.overlay(surf, lines)
-
-    # ------------------------------------------------------------ events
-    def handle(self, ev):
-        if self.state == "join" and ev.type == pygame.TEXTINPUT:
-            ch = "".join(c for c in ev.text if c.isalnum() or c in ".:-")
-            self.ip_text = (self.ip_text + ch)[:60]
-            return True
-        if ev.type != pygame.KEYDOWN:
-            return True
-        if self.mode == "client":
-            if ev.key == pygame.K_ESCAPE:
-                self.leave_online()
-            return True
-        if self.state == "lobby":
-            if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                self.reset()
-                self.state = "play"
-            elif ev.key == pygame.K_ESCAPE:
-                self.leave_online()
-            return True
-        if self.state == "join":
-            if ev.key == pygame.K_BACKSPACE:
-                self.ip_text = self.ip_text[:-1]
-            elif ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER) and self.ip_text.strip():
-                self.start_join()
-            elif ev.key == pygame.K_ESCAPE:
-                self.state = "menu"
-            return True
-        if self.mode == "host" and ev.key == pygame.K_ESCAPE and self.state != "finish":
-            self.leave_online()
-            return True
-        if self.state == "menu":
-            if ev.key in (pygame.K_1, pygame.K_KP1):
-                self.mode = "solo"
-                self.reset()
-                self.state = "play"
-            elif ev.key in (pygame.K_2, pygame.K_KP2):
-                self.mode = "coop"
-                self.reset()
-                self.state = "play"
-            elif ev.key in (pygame.K_3, pygame.K_KP3):
-                self.start_host()
-            elif ev.key in (pygame.K_4, pygame.K_KP4):
-                self.state = "join"
-            elif ev.key == pygame.K_ESCAPE:
-                return False
-        elif self.state == "play":
-            if ev.key == pygame.K_ESCAPE:
-                self.state = "pause"
-        elif self.state == "pause":
-            if ev.key == pygame.K_ESCAPE:
-                self.state = "play"
-            elif ev.key == pygame.K_r:
-                self.reset()
-                self.state = "play"
-            elif ev.key == pygame.K_q:
-                self.reset()
-                self.state = "menu"
-        elif self.state == "finish":
-            if ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
-                self.reset()
-                self.state = "play"
-            elif ev.key == pygame.K_ESCAPE:
-                if self.mode == "host":
-                    self.leave_online()
-                else:
-                    self.reset()
-                    self.state = "menu"
-        return True
+    def update_camera(self, dt, pos):
+        w = self.world
+        fx, fy = sim.flow_dir(max(-500, -w.y) + 250)
+        fwd = Vec3(fx, -fy, 0)
+        fwd.normalize()
+        focus = Vec3(pos) if w.falling <= 0 else to3d(w.x, w.y)
+        want = focus - fwd * 3.9 + Vec3(0, 0, 2.7)
+        look = focus + fwd * 2.0 + Vec3(0, 0, 0.4)
+        if w.state == "menu":
+            a = w.t * 0.15
+            want = focus + Vec3(math.sin(a) * 5, -math.cos(a) * 5, 2.8)
+            look = focus
+        if self.cam_pos is None:
+            self.cam_pos, self.cam_look = want, look
+        self.cam_pos = self.cam_pos + (want - self.cam_pos) * min(1, dt * 4)
+        self.cam_look = self.cam_look + (look - self.cam_look) * min(1, dt * 6)
+        jitter = Vec3(random.uniform(-1, 1), random.uniform(-1, 1), random.uniform(-1, 1)) * self.shake * 0.25
+        self.shake = max(0, self.shake - dt)
+        self.camera.set_pos(self.cam_pos + jitter)
+        self.camera.look_at(self.cam_look)
+        self.camLens.set_fov(62)
 
 
 def main():
-    try:
-        pygame.mixer.pre_init(22050, -16, 2, 512)
-    except Exception:
-        pass
-    pygame.init()
-    try:
-        pygame.mixer.init()
-        pygame.mixer.set_num_channels(16)
-    except Exception:
-        pass
-    pygame.display.set_caption("Fart Together")
-    screen = pygame.display.set_mode((W, H))
-    clock = pygame.time.Clock()
-    game = Game(screen)
-    frames = int(os.environ.get("FT_TEST_FRAMES", "0"))
-    n = 0
-    running = True
-    while running:
-        dt = min(clock.tick(FPS) / 1000.0, 1 / 30)
-        for ev in pygame.event.get():
-            if ev.type == pygame.QUIT:
-                running = False
-            elif not game.handle(ev):
-                running = False
-        game.update(dt, pygame.key.get_pressed())
-        game.net_tick()
-        game.draw()
-        pygame.display.flip()
-        n += 1
-        if frames and n >= frames:
-            running = False
-    if game.net:
-        game.net.close()
-    pygame.quit()
+    FartApp().run()
 
 
 if __name__ == "__main__":

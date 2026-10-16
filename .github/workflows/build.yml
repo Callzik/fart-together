@@ -5,15 +5,15 @@ on:
   workflow_dispatch:
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install -r requirements.txt pyinstaller
-      - run: python -m PyInstaller --onefile --windowed --name FartTogether fart_together.py
+      - run: python -m pip install -r requirements.txt setuptools
+      - run: python setup.py build_apps
       - uses: actions/upload-artifact@v4
         with:
           name: FartTogether-windows
-          path: dist/FartTogether.exe
+          path: build/win_amd64
