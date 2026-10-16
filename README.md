@@ -11,8 +11,14 @@
 
 ## Запуск
 
-**Windows, без Python:** скачай `FartTogether-windows.zip` со страницы
-[Releases](https://github.com/Callzik/fart-together/releases/latest), распакуй целиком и запусти `FartTogether.exe`.
+**Windows:** скачай `FartTogether-Setup.exe` со страницы
+[Releases](https://github.com/Callzik/fart-together/releases/latest) и запусти. Установщик сам всё поставит
+(Python не нужен, права администратора тоже), создаст ярлык на рабочем столе и в меню «Пуск».
+Если Windows покажет «Windows защитила ваш компьютер», нажми «Подробнее» → «Выполнить в любом случае»
+(так бывает со всеми неподписанными программами).
+Удалить: «Параметры → Приложения» или ярлык «Удалить Fart Together» в «Пуск».
+
+Без установки: там же есть `FartTogether-windows.zip`, распакуй и запусти `FartTogether.exe`.
 
 **Как выпустить новую версию:** на GitHub открой **Actions → Build Windows exe → Run workflow**,
 впиши версию (например `v2.1`) и нажми **Run workflow**. Игра соберётся, и появится релиз с zip.
