@@ -37,6 +37,11 @@ python fart_together.py
 `net.py` — сеть, `fart_together.py` — игра, камера, интерфейс.
 Шрифт DejaVu Sans (`assets/`), лицензия в `assets/DejaVu-LICENSE.txt`.
 
+Звуки пуков (12 штук: короткие, басовые, мокрые, писклявые, очередью) синтезированы кодом
+`tools/make_farts.py` и лежат в `assets/sfx/`. У каждого зверя свой набор: лягуха мокрая,
+мишаня и бегемот басовые, мартын писклявый. Перегенерировать: `pip install numpy scipy`,
+`python tools/make_farts.py`.
+
 ## Управление
 
 | Режим | Клавиши |

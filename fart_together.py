@@ -58,17 +58,14 @@ def write_wav(path, samples, rate=22050):
         w.writeframes(buf.tobytes())
 
 
-def fart_samples(seed, rate=22050):
-    rnd = random.Random(seed)
-    dur = 0.35 + rnd.random() * 0.25
-    base = 70 + rnd.random() * 60
-    phase = 0.0
-    for i in range(int(rate * dur)):
-        t = i / rate
-        f = base * (1 + 0.35 * math.sin(t * 38 + seed)) * (1 - 0.3 * t / dur)
-        phase += f / rate
-        v = (1.0 if (phase % 1.0) < 0.35 else -0.6) + rnd.uniform(-0.5, 0.5)
-        yield v * min(1.0, t * 40) * (1 - t / dur) ** 1.5 * 0.5
+# Звуки пуков лежат в assets/sfx (их делает tools/make_farts.py). У каждого зверя свой «характер»:
+# вес варианта = насколько часто он звучит у этого зверя.
+FART_TASTE = {
+    "frog": {"wet_splat": 3, "wet_long": 3, "sputter": 2, "short_pfft": 2, "classic_brap": 1, "staccato": 1},
+    "bear": {"long_rumble": 3, "bass_bomb": 3, "classic_brap": 2, "sputter": 1, "short_pfft": 1},
+    "hippo": {"bass_bomb": 3, "long_rumble": 2, "wet_long": 2, "classic_brap": 2, "trumpet": 1},
+    "monkey": {"squeaker": 3, "whine": 2, "tiny_toot": 2, "trumpet": 2, "staccato": 2, "short_pfft": 1},
+}
 
 
 def bonk_samples(rate=22050):
@@ -240,18 +237,42 @@ class FartApp(ShowBase):
         self.ring_timer = 0.0
 
     def setup_sounds(self):
-        self.sfx, self.bonk = [], None
+        # у каждого зверя свои копии звуков, чтобы все четверо могли пукать одновременно
+        self.sfx = [[] for _ in self.world.seats]  # [(звук, вес)]
+        self.playing = [None] * len(self.world.seats)
+        self.was_farting = [False] * len(self.world.seats)
+        self.bonk = None
+        for i, seat in enumerate(self.world.seats):
+            for name, weight in FART_TASTE[seat.kind].items():
+                try:
+                    snd = self.loader.load_sfx(asset(os.path.join("sfx", f"fart_{name}.wav")))
+                    self.sfx[i].append((snd, weight))
+                except Exception:
+                    pass
         try:
             d = tempfile.mkdtemp(prefix="fart_together_")
-            for i in range(4):
-                p = os.path.join(d, f"fart{i}.wav")
-                write_wav(p, list(fart_samples(i)))
-                self.sfx.append(self.loader.load_sfx(Filename.from_os_specific(p).get_fullpath()))
             p = os.path.join(d, "bonk.wav")
             write_wav(p, list(bonk_samples()))
             self.bonk = self.loader.load_sfx(Filename.from_os_specific(p).get_fullpath())
         except Exception:
-            self.sfx = []
+            pass
+
+    def fart_sound(self, i, farting):
+        """Новый пук на каждое нажатие; пока держишь — следующий, когда кончится предыдущий."""
+        started = farting and not self.was_farting[i]
+        self.was_farting[i] = farting
+        cur = self.playing[i]
+        busy = cur is not None and cur.status() == cur.PLAYING
+        if not self.sfx[i] or not farting or (busy and not started):
+            return
+        if busy:
+            cur.stop()
+        sounds, weights = zip(*self.sfx[i])
+        snd = random.choices(sounds, weights)[0]
+        snd.set_play_rate(random.uniform(0.85, 1.18))
+        snd.set_volume(random.uniform(0.75, 1.0))
+        snd.play()
+        self.playing[i] = snd
 
     # ------------------------------------------------------------ HUD
     def text(self, txt="", pos=(0, 0), scale=0.06, parent=None, align=TextNode.A_center):
@@ -625,12 +646,10 @@ class FartApp(ShowBase):
             if self.label_cache[i] != name:
                 self.label_cache[i] = name
                 lbl.node().set_text(name)
-            if seat.farting and w.state == "play":
+            farting = seat.farting and w.state == "play"
+            if farting:
                 self.emit_gas(pos, sx, sy)
-                snd = self.sfx[i] if self.sfx else None
-                if snd and snd.status() != snd.PLAYING:
-                    snd.set_play_rate(random.uniform(0.85, 1.2))
-                    snd.play()
+            self.fart_sound(i, farting)
         for ev in w.events:
             if ev == "hit":
                 self.shake = 0.35
